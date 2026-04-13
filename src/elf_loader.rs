@@ -2,16 +2,23 @@ use goblin::elf::program_header::PT_LOAD;
 use goblin::elf::Elf;
 use std::error::Error;
 
+/// Stack reserved above the segment area (4 MiB).
+const STACK_SIZE: usize = 4 * 1024 * 1024;
+
 /// A RISC-V ELF binary loaded into a flat virtual address space.
 pub struct LoadedElf {
-    /// Flat byte buffer spanning address 0 to the highest virtualaddress
-    /// covered by any PT_LOAD segment.  Bytes not covered by any segment
-    /// are zero-initialised.
+    /// Flat byte buffer spanning address 0 to the highest virtual address
+    /// covered by any PT_LOAD segment, plus a STACK_SIZE guard region.
     pub mem: Vec<u8>,
     /// The ELF entry point virtual address.
     pub entry: u64,
+    /// Start of the executable code region (≤ entry).
+    pub text_base: u64,
     /// Virtual address one past the last byte of the executable (.text) segment.
     pub text_end: u64,
+    /// Initial stack pointer: top of the stack region (exclusive upper bound).
+    /// The emulator should set x2 (sp) to this value before executing.
+    pub stack_top: u64,
 }
 
 /// Parse an ELF64 RISC-V binary from `path`, map every `PT_LOAD` segment
@@ -39,8 +46,10 @@ pub fn load(path: &str) -> Result<LoadedElf, Box<dyn Error>> {
         .max()
         .ok_or_else(|| format!("{}: no PT_LOAD segments", path))? as usize;
 
-    // Allocate the flat virtual memory, zero-initialised.
-    let mut mem = vec![0u8; max_addr];
+    // Allocate the flat virtual memory, zero-initialised.  Append STACK_SIZE bytes
+    // so that the guest's stack pointer starts at (max_addr + STACK_SIZE).
+    let mem_size = max_addr + STACK_SIZE;
+    let mut mem = vec![0u8; mem_size];
 
     // Copy each PT_LOAD segment's file bytes into the correct virtual address.
     for ph in &elf.program_headers {
@@ -59,19 +68,43 @@ pub fn load(path: &str) -> Result<LoadedElf, Box<dyn Error>> {
         // region, which is already zero from vec! initialisation.
     }
 
-    // Find the end of the executable (.text) segment.
+    // Find the end of the executable code.  Prefer the `.text` section's
+    // extent when section headers are available.  Fall back to the end of
+    // the executable PT_LOAD segment if they are stripped.
     use goblin::elf::program_header::PF_X;
-    let text_end = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD && ph.p_flags & PF_X != 0)
-        .map(|ph| ph.p_vaddr + ph.p_memsz)
-        .max()
-        .unwrap_or(elf.entry + 4) as u64;
+    let (text_base, text_end) = {
+        // Try section headers first.
+        let section_range = elf
+            .section_headers
+            .iter()
+            .filter(|sh| {
+                elf.shdr_strtab
+                    .get_at(sh.sh_name)
+                    .map(|n| n == ".text")
+                    .unwrap_or(false)
+            })
+            .map(|sh| (sh.sh_addr, sh.sh_addr + sh.sh_size))
+            .next();
+
+        // Fall back to the executable PT_LOAD segment.
+        let segment_range = elf
+            .program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD && ph.p_flags & PF_X != 0)
+            .map(|ph| (ph.p_vaddr, ph.p_vaddr + ph.p_memsz))
+            .next();
+
+        section_range
+            .or(segment_range)
+            .unwrap_or((elf.entry, elf.entry + 4))
+    };
+    let (text_base, text_end) = (text_base as u64, text_end as u64);
 
     Ok(LoadedElf {
         mem,
         entry: elf.entry,
+        text_base,
         text_end,
+        stack_top: mem_size as u64,
     })
 }

@@ -22,7 +22,9 @@ fn main() {
     let code = if use_jit {
         jit::run(&loaded)
     } else {
+        let stack_top = loaded.stack_top;
         let mut emu = emulator::Emulator::new(loaded.mem, loaded.entry);
+        emu.regs[2] = stack_top; // x2 (sp) – required by C ABI
         emu.run()
     };
 
