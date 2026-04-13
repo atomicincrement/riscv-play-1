@@ -8,3 +8,4 @@ asm/*.x86_64.s
 # Assembled/linked ELF binaries in asm/ (no extension)
 asm/hello
 asm/arith
+asm/call

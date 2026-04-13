@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     assemble("hello");
     assemble("arith");
+    assemble("call");
 }
 
 fn assemble(name: &str) {
