@@ -463,15 +463,29 @@ is excluded, since it executes native x86-64 instructions instead of a dispatch 
 ```toml
 [dependencies]
 goblin  = "0.9"    # ELF parsing
-inkwell = { version = "0.4", features = ["llvm18-0"] }  # LLVM JIT
+inkwell = { version = "0.5", features = ["llvm18-0"] }  # LLVM JIT (Rust bindings)
+llvm-sys = { version = "180", features = ["prefer-dynamic"] }  # link against libLLVM-18.so
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 ```
 
+LLVM 18 dev headers are required. Install with:
+```bash
+sudo apt install llvm-18-dev
+```
+Set the prefix so llvm-sys can locate `llvm-config-18`:
+```toml
+# .cargo/config.toml
+[env]
+LLVM_SYS_180_PREFIX = "/usr/lib/llvm-18"
+```
+
 ## File layout (planned)
 
 ```
+.cargo/
+  config.toml    # LLVM_SYS_180_PREFIX env var for inkwell/llvm-sys
 build.rs           # assembles asm/hello.s → asm/hello via riscv64-linux-gnu toolchain
 src/
   main.rs          # CLI entry point: load binary, run emulator or JIT

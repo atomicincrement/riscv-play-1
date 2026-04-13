@@ -10,6 +10,8 @@ pub struct LoadedElf {
     pub mem: Vec<u8>,
     /// The ELF entry point virtual address.
     pub entry: u64,
+    /// Virtual address one past the last byte of the executable (.text) segment.
+    pub text_end: u64,
 }
 
 /// Parse an ELF64 RISC-V binary from `path`, map every `PT_LOAD` segment
@@ -57,8 +59,19 @@ pub fn load(path: &str) -> Result<LoadedElf, Box<dyn Error>> {
         // region, which is already zero from vec! initialisation.
     }
 
+    // Find the end of the executable (.text) segment.
+    use goblin::elf::program_header::PF_X;
+    let text_end = elf
+        .program_headers
+        .iter()
+        .filter(|ph| ph.p_type == PT_LOAD && ph.p_flags & PF_X != 0)
+        .map(|ph| ph.p_vaddr + ph.p_memsz)
+        .max()
+        .unwrap_or(elf.entry + 4) as u64;
+
     Ok(LoadedElf {
         mem,
         entry: elf.entry,
+        text_end,
     })
 }

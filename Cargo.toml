@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 goblin = "0.9"
+inkwell = { version = "0.5", features = ["llvm18-0"] }
+llvm-sys = { version = "180", features = ["prefer-dynamic"] }
