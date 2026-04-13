@@ -1,5 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
+use std::sync::Mutex;
+
+// Multimap recording (jalr_pc -> set of observed targets) across all JIT runs.
+// Populated by jit_jalr_interp; consulted during recompilation to build switch tables.
+static JALR_TARGETS: Mutex<BTreeMap<u64, BTreeSet<u64>>> = Mutex::new(BTreeMap::new());
 
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -45,15 +50,23 @@ pub extern "C" fn jit_ecall(regs: *mut i64, mem: *const u8, mem_len: u64) -> i32
     }
 }
 
-/// Called for `jalr` — indirect jump whose target is only known at runtime.
-/// Restores the full register file into an interpreter and runs to completion.
+/// Called for `jalr` when the target is not yet in the switch table.
+/// Records the (jalr_pc → target) observation so the next recompilation can
+/// inline a branch directly to the target's BB, then falls back to the interpreter.
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_jalr_interp(
     regs: *mut i64,
     mem:  *const u8,
     mem_len: u64,
     target: u64,
+    jalr_pc: u64,
 ) -> i32 {
+    // Record the observation.
+    JALR_TARGETS.lock().unwrap()
+        .entry(jalr_pc)
+        .or_default()
+        .insert(target);
+
     let regs_slice = unsafe { std::slice::from_raw_parts(regs, 32) };
     let mem_copy: Vec<u8> =
         unsafe { std::slice::from_raw_parts(mem, mem_len as usize) }.to_vec();
@@ -76,6 +89,11 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
     Target::initialize_native(&InitializationConfig::default())
         .expect("failed to initialise native LLVM target");
 
+    loop {
+    // Snapshot the observed indirect-jump map before this compilation.
+    // If new targets are discovered during execution we recompile and retry.
+    let jalr_map: BTreeMap<u64, BTreeSet<u64>> = JALR_TARGETS.lock().unwrap().clone();
+
     let context = Context::create();
     let module  = context.create_module("riscv_jit");
     let builder = context.create_builder();
@@ -95,9 +113,9 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
     let ecall_decl =
         module.add_function("jit_ecall", ecall_fn_type, Some(Linkage::External));
 
-    // jit_jalr_interp(ptr regs, ptr mem, i64 mem_len, i64 target) -> i32
+    // jit_jalr_interp(ptr regs, ptr mem, i64 mem_len, i64 target, i64 jalr_pc) -> i32
     let jalr_fn_type = i32_type.fn_type(
-        &[ptr_type.into(), ptr_type.into(), i64_type.into(), i64_type.into()], false);
+        &[ptr_type.into(), ptr_type.into(), i64_type.into(), i64_type.into(), i64_type.into()], false);
     let jalr_decl =
         module.add_function("jit_jalr_interp", jalr_fn_type, Some(Linkage::External));
 
@@ -119,8 +137,6 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
 
     let mut bb_entries: BTreeSet<u64> = BTreeSet::new();
     bb_entries.insert(entry_addr);
-    // Addresses of the instruction after each jal — valid ret targets.
-    let mut jal_return_sites: BTreeSet<u64> = BTreeSet::new();
 
     let mut scan_pc = text_base; // scan all of .text, not just from entry
     while scan_pc + 4 <= text_end {
@@ -136,14 +152,16 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
                 let raw = (b20 << 20) | (b19_12 << 12) | (b11 << 11) | (b10_1 << 1);
                 let imm_j  = if b20 != 0 { raw | !0x1F_FFFFu64 } else { raw };
                 let target = (scan_pc as u64).wrapping_add(imm_j);
-                let ret_site = (scan_pc + 4) as u64;
                 bb_entries.insert(target);
-                bb_entries.insert(ret_site);      // fallthrough (after return)
-                jal_return_sites.insert(ret_site); // ret branch-table target
+                bb_entries.insert((scan_pc + 4) as u64); // fallthrough after return
             }
-            // jalr: indirect — only fallthrough is a separate BB
+            // jalr: indirect — add the fallthrough BB plus any targets already
+            // observed at runtime (so their BBs exist for the switch table).
             0x67 => {
                 bb_entries.insert((scan_pc + 4) as u64);
+                if let Some(targets) = jalr_map.get(&(scan_pc as u64)) {
+                    for &t in targets { bb_entries.insert(t); }
+                }
             }
             // conditional branches
             0x63 => {
@@ -166,7 +184,6 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
 
     // ---- Create an LLVM BB for every entry address ------------------------
 
-    use std::collections::HashMap;
     let mut bb_map: HashMap<u64, inkwell::basic_block::BasicBlock> = HashMap::new();
 
     // The very first BB is the alloca/memset BB; translation starts in a fresh BB.
@@ -248,13 +265,18 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
 
     // ---- Pass 2: Translate instructions ----------------------------------
 
-    // Position at the entry BB.
-    builder.position_at_end(first_bb);
-    let mut needs_terminator = true; // does the current BB still need a terminator?
-    let mut skip = false;            // true when in dead code (backward branch to already-translated BB)
+    // Do NOT pre-position at first_bb.  The builder is currently at alloca_bb
+    // (already terminated with `br first_bb`).  Start the scan in "dead-code"
+    // mode so that the first untranslated BB entry we encounter bootstraps
+    // translation naturally via the normal BB-transition logic, without adding
+    // a spurious branch from first_bb to whatever happens to be at text_base
+    // (which may be a helper that precedes _start in the text section).
+    // first_bb (_start) is correctly reached because text_base ≤ entry_addr ≤
+    // text_end, so the scan always crosses entry_addr and positions there.
+    let mut needs_terminator = false;
+    let mut skip = true;
 
     let mut pc = text_base;
-
     while pc + 4 <= text_end {
         // If this PC is a BB entry, handle the transition.
         let pc_addr = pc as u64;
@@ -351,36 +373,41 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
                 // Store rd = PC + 4 (link register).
                 store_reg!(rd, i64_type.const_int((pc as u64).wrapping_add(4), false));
 
-                // For `ret` (rd=x0, rs1=ra, imm=0) emit a branch table over all
-                // known JAL return sites instead of calling the interpreter.
-                if rd == 0 && rs1 == 1 && imm_i == 0 && !jal_return_sites.is_empty() {
-                    let interp_bb = context.append_basic_block(main_fn, "ret_interp");
-                    let cases: Vec<(inkwell::values::IntValue, inkwell::basic_block::BasicBlock)> =
-                        jal_return_sites.iter()
-                            .filter_map(|&site| bb_map.get(&site).map(|&bb| {
-                                (i64_type.const_int(site, false), bb)
-                            }))
-                            .collect();
-                    builder.build_switch(target, interp_bb, &cases).unwrap();
-                    // Default: target not in the table — fall back to interpreter.
-                    builder.position_at_end(interp_bb);
-                    let call = builder.build_call(
-                        jalr_decl,
-                        &[regs_alloca.into(), mem_param.into(), mem_len_param.into(), target.into()],
-                        "jalr_ret",
-                    ).unwrap();
-                    let ret_val = call.try_as_basic_value().left().unwrap().into_int_value();
-                    builder.build_return(Some(&ret_val)).unwrap();
+                // Constant for jalr_pc — passed to the interpreter fallback so it
+                // can record new (jalr_pc → target) observations in JALR_TARGETS.
+                let jalr_pc_v = i64_type.const_int(pc as u64, false);
+
+                // Build an interpreter-fallback block used as the switch default.
+                let interp_lbl = format!("jalr_interp_{:#x}", pc as u64);
+                let interp_bb  = context.append_basic_block(main_fn, &interp_lbl);
+
+                // Build switch cases from previously observed targets.
+                let cases: Vec<(inkwell::values::IntValue, inkwell::basic_block::BasicBlock)> =
+                    jalr_map.get(&(pc as u64))
+                        .into_iter().flatten()
+                        .filter_map(|&t| bb_map.get(&t).map(|&bb| {
+                            (i64_type.const_int(t, false), bb)
+                        }))
+                        .collect();
+
+                // Emit switch (or plain branch to interp if no targets known yet).
+                if cases.is_empty() {
+                    builder.build_unconditional_branch(interp_bb).unwrap();
                 } else {
-                    // General jalr — fall back to interpreter.
-                    let call = builder.build_call(
-                        jalr_decl,
-                        &[regs_alloca.into(), mem_param.into(), mem_len_param.into(), target.into()],
-                        "jalr_ret",
-                    ).unwrap();
-                    let ret_val = call.try_as_basic_value().left().unwrap().into_int_value();
-                    builder.build_return(Some(&ret_val)).unwrap();
+                    builder.build_switch(target, interp_bb, &cases).unwrap();
                 }
+
+                // Interpreter fallback: record observation then delegate.
+                builder.position_at_end(interp_bb);
+                let call = builder.build_call(
+                    jalr_decl,
+                    &[regs_alloca.into(), mem_param.into(), mem_len_param.into(),
+                      target.into(), jalr_pc_v.into()],
+                    "jalr_ret",
+                ).unwrap();
+                let ret_val = call.try_as_basic_value().left().unwrap().into_int_value();
+                builder.build_return(Some(&ret_val)).unwrap();
+
                 needs_terminator = false;
             }
 
@@ -746,5 +773,13 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
         jit_main.call(loaded.mem.as_ptr(), loaded.mem.len() as u64, loaded.stack_top)
     };
 
-    exit_code
+    // If execution caused jit_jalr_interp to record new targets, the map has
+    // grown since we took the snapshot.  Recompile with the enlarged table so
+    // the next run uses inline switch arms for those targets.
+    let jalr_map_now = JALR_TARGETS.lock().unwrap().clone();
+    if jalr_map_now == jalr_map {
+        return exit_code;
+    }
+    eprintln!("jit: new indirect-jump targets observed, recompiling");
+    } // loop
 }
