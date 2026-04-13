@@ -1,3 +1,10 @@
 /target
-asm/hello.o
+
+# Build outputs from asm/
+asm/*.o
+asm/*.ll
+asm/*.x86_64.s
+
+# Assembled/linked ELF binaries in asm/ (no extension)
 asm/hello
+asm/arith
