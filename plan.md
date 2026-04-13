@@ -160,12 +160,21 @@ Hello, world!
 translating them to host syscalls — the same job our emulator will do. If this step fails, the
 problem is in the assembly source or the toolchain, not in the Rust code.
 
-#### Automate as a Cargo alias
+#### Automate with a helper script
 
-Add to `.cargo/config.toml` so `cargo qemu` runs the test binary:
-```toml
-[alias]
-qemu = "!qemu-riscv64 asm/hello"
+Cargo aliases only invoke Cargo subcommands, not arbitrary shell commands, so a small
+script is the simplest approach:
+
+```bash
+#!/usr/bin/env bash
+# scripts/qemu-test.sh
+set -e
+qemu-riscv64 asm/hello
+```
+
+Run it with:
+```bash
+bash scripts/qemu-test.sh
 ```
 
 ---
