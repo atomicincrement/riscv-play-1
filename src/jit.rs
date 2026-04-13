@@ -119,6 +119,8 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
 
     let mut bb_entries: BTreeSet<u64> = BTreeSet::new();
     bb_entries.insert(entry_addr);
+    // Addresses of the instruction after each jal — valid ret targets.
+    let mut jal_return_sites: BTreeSet<u64> = BTreeSet::new();
 
     let mut scan_pc = text_base; // scan all of .text, not just from entry
     while scan_pc + 4 <= text_end {
@@ -134,8 +136,10 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
                 let raw = (b20 << 20) | (b19_12 << 12) | (b11 << 11) | (b10_1 << 1);
                 let imm_j  = if b20 != 0 { raw | !0x1F_FFFFu64 } else { raw };
                 let target = (scan_pc as u64).wrapping_add(imm_j);
+                let ret_site = (scan_pc + 4) as u64;
                 bb_entries.insert(target);
-                bb_entries.insert((scan_pc + 4) as u64); // fallthrough (after return)
+                bb_entries.insert(ret_site);      // fallthrough (after return)
+                jal_return_sites.insert(ret_site); // ret branch-table target
             }
             // jalr: indirect — only fallthrough is a separate BB
             0x67 => {
@@ -344,16 +348,39 @@ pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
                 let sum    = builder.build_int_add(rs1_v, imm_v, "jalr_sum").unwrap();
                 let mask   = i64_type.const_int(!1u64, false);
                 let target = builder.build_and(sum, mask, "jalr_target").unwrap();
-                // Store rd = PC + 4.
+                // Store rd = PC + 4 (link register).
                 store_reg!(rd, i64_type.const_int((pc as u64).wrapping_add(4), false));
-                // Fall back to interpreter for the remainder.
-                let call = builder.build_call(
-                    jalr_decl,
-                    &[regs_alloca.into(), mem_param.into(), mem_len_param.into(), target.into()],
-                    "jalr_ret",
-                ).unwrap();
-                let ret_val = call.try_as_basic_value().left().unwrap().into_int_value();
-                builder.build_return(Some(&ret_val)).unwrap();
+
+                // For `ret` (rd=x0, rs1=ra, imm=0) emit a branch table over all
+                // known JAL return sites instead of calling the interpreter.
+                if rd == 0 && rs1 == 1 && imm_i == 0 && !jal_return_sites.is_empty() {
+                    let interp_bb = context.append_basic_block(main_fn, "ret_interp");
+                    let cases: Vec<(inkwell::values::IntValue, inkwell::basic_block::BasicBlock)> =
+                        jal_return_sites.iter()
+                            .filter_map(|&site| bb_map.get(&site).map(|&bb| {
+                                (i64_type.const_int(site, false), bb)
+                            }))
+                            .collect();
+                    builder.build_switch(target, interp_bb, &cases).unwrap();
+                    // Default: target not in the table — fall back to interpreter.
+                    builder.position_at_end(interp_bb);
+                    let call = builder.build_call(
+                        jalr_decl,
+                        &[regs_alloca.into(), mem_param.into(), mem_len_param.into(), target.into()],
+                        "jalr_ret",
+                    ).unwrap();
+                    let ret_val = call.try_as_basic_value().left().unwrap().into_int_value();
+                    builder.build_return(Some(&ret_val)).unwrap();
+                } else {
+                    // General jalr — fall back to interpreter.
+                    let call = builder.build_call(
+                        jalr_decl,
+                        &[regs_alloca.into(), mem_param.into(), mem_len_param.into(), target.into()],
+                        "jalr_ret",
+                    ).unwrap();
+                    let ret_val = call.try_as_basic_value().left().unwrap().into_int_value();
+                    builder.build_return(Some(&ret_val)).unwrap();
+                }
                 needs_terminator = false;
             }
 
