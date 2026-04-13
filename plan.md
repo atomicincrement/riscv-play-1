@@ -270,7 +270,167 @@ store i64 %result, i64* %regs_rd
 
 ---
 
-### 7) Benchmark the interpreted and JIT-compiled versions
+### 7) Extend the interpreter to the full RV64I integer instruction set
+
+The hello-world binary only exercises a tiny subset of RV64I. To run real programs the interpreter
+needs to cover all base integer instructions. This section enumerates every instruction in the
+RV64I spec, grouped by encoding format, showing what must be added on top of the current
+`addi` / `auipc` / `ecall` skeleton.
+
+**Opcode map** (bits 6:0 of every 32-bit instruction):
+
+| Opcode | Format | Mnemonic group |
+|--------|--------|----------------|
+| `0x37` | U      | `lui` |
+| `0x17` | U      | `auipc` ✓ (implemented) |
+| `0x6F` | J      | `jal` |
+| `0x67` | I      | `jalr` |
+| `0x63` | B      | `beq bne blt bge bltu bgeu` |
+| `0x03` | I      | loads: `lb lh lw ld lbu lhu lwu` |
+| `0x23` | S      | stores: `sb sh sw sd` |
+| `0x13` | I      | integer-immediate: `addi` ✓ `slti sltiu xori ori andi slli srli srai` |
+| `0x1B` | I      | 32-bit immediate: `addiw slliw srliw sraiw` |
+| `0x33` | R      | integer-register: `add sub sll slt sltu xor srl sra or and` |
+| `0x3B` | R      | 32-bit register: `addw subw sllw srlw sraw` |
+| `0x73` | I      | `ecall` ✓ `ebreak` CSRs (optional) |
+| `0x0F` | I      | `fence` (treat as no-op for single-threaded emulation) |
+
+#### Encoding formats (reminder)
+
+All instructions are 32 bits, little-endian.
+
+```
+R  [ funct7 | rs2 | rs1 | funct3 | rd  | opcode ]
+   [31    25|24 20|19 15|14    12|11 7 |6      0]
+
+I  [ imm[11:0]   | rs1 | funct3 | rd  | opcode ]
+   [31         20|19 15|14    12|11 7 |6      0]
+
+S  [ imm[11:5] | rs2 | rs1 | funct3 | imm[4:0] | opcode ]
+   [31       25|24 20|19 15|14    12|11       7|6      0]
+
+B  [ imm[12|10:5] | rs2 | rs1 | funct3 | imm[4:1|11] | opcode ]
+   [31          25|24 20|19 15|14    12|11           7|6      0]
+
+U  [ imm[31:12]            | rd  | opcode ]
+   [31                   12|11 7 |6      0]
+
+J  [ imm[20|10:1|11|19:12] | rd  | opcode ]
+   [31                   12|11 7 |6      0]
+```
+
+#### Instruction-by-instruction implementation notes
+
+**U-type**
+
+| Mnemonic | Opcode | Operation |
+|----------|--------|-----------|
+| `lui`    | `0x37` | `rd = imm` (upper 20 bits, low 12 zeroed, sign-extended to 64) |
+| `auipc`  | `0x17` | `rd = pc + imm` ✓ |
+
+**J-type**
+
+| Mnemonic | Operation |
+|----------|-----------|
+| `jal rd, offset` | `rd = pc + 4; pc += sign_extend(imm)`. Immediate is 21-bit byte offset assembled from bits 31, 19:12, 20, 10:1 (× 2 LSB implied). |
+
+**I-type jumps / loads**
+
+| Mnemonic | funct3 | Operation |
+|----------|--------|-----------|
+| `jalr rd, rs1, imm` | — | `tmp = (rs1 + imm) & !1; rd = pc+4; pc = tmp` |
+| `lb`  | `0x0` | `rd = sign_extend_8(mem[rs1+imm])` |
+| `lh`  | `0x1` | `rd = sign_extend_16(mem[rs1+imm])` |
+| `lw`  | `0x2` | `rd = sign_extend_32(mem[rs1+imm])` |
+| `ld`  | `0x3` | `rd = mem[rs1+imm]` (64-bit) |
+| `lbu` | `0x4` | `rd = zero_extend_8(mem[rs1+imm])` |
+| `lhu` | `0x5` | `rd = zero_extend_16(mem[rs1+imm])` |
+| `lwu` | `0x6` | `rd = zero_extend_32(mem[rs1+imm])` |
+
+**B-type branches** — immediate is 13-bit byte offset (LSB implied 0)
+
+| Mnemonic | funct3 | Condition |
+|----------|--------|-----------|
+| `beq`  | `0x0` | `rs1 == rs2` |
+| `bne`  | `0x1` | `rs1 != rs2` |
+| `blt`  | `0x4` | `(rs1 as i64) < (rs2 as i64)` |
+| `bge`  | `0x5` | `(rs1 as i64) >= (rs2 as i64)` |
+| `bltu` | `0x6` | `rs1 < rs2` (unsigned) |
+| `bgeu` | `0x7` | `rs1 >= rs2` (unsigned) |
+
+If taken: `pc += sign_extend(imm)`.  If not taken: `pc += 4`.
+
+**S-type stores**
+
+| Mnemonic | funct3 | Operation |
+|----------|--------|-----------|
+| `sb` | `0x0` | `mem[rs1+imm][0]    = rs2 as u8` |
+| `sh` | `0x1` | `mem[rs1+imm][0..2] = rs2 as u16 LE` |
+| `sw` | `0x2` | `mem[rs1+imm][0..4] = rs2 as u32 LE` |
+| `sd` | `0x3` | `mem[rs1+imm][0..8] = rs2 as u64 LE` |
+
+S-type immediate: `imm = sign_extend({ insn[31:25], insn[11:7] })`.
+
+**I-type integer-immediate** (opcode `0x13`)
+
+| funct3 | Mnemonic | Operation |
+|--------|----------|-----------|
+| `0x0` | `addi`  | `rd = rs1 + imm` ✓ |
+| `0x2` | `slti`  | `rd = ((rs1 as i64) < (imm as i64)) as u64` |
+| `0x3` | `sltiu` | `rd = (rs1 < imm) as u64` (unsigned) |
+| `0x4` | `xori`  | `rd = rs1 ^ imm` |
+| `0x6` | `ori`   | `rd = rs1 \| imm` |
+| `0x7` | `andi`  | `rd = rs1 & imm` |
+| `0x1` | `slli`  | `rd = rs1 << shamt` (shamt = imm[5:0]) |
+| `0x5` | `srli` / `srai` | funct7 bit 30: `0` → logical, `1` → arithmetic |
+
+**I-type 32-bit immediate** (opcode `0x1B`) — result sign-extended to 64 bits
+
+| funct3 | Mnemonic | Operation |
+|--------|----------|-----------|
+| `0x0` | `addiw` | `rd = sign_extend_32(rs1 as u32 + imm as u32)` |
+| `0x1` | `slliw` | `rd = sign_extend_32((rs1 as u32) << shamt)` |
+| `0x5` | `srliw` / `sraiw` | funct7 bit 30: `0` → logical, `1` → arithmetic |
+
+**R-type integer-register** (opcode `0x33`)
+
+| funct7 | funct3 | Mnemonic | Operation |
+|--------|--------|----------|-----------|
+| `0x00` | `0x0` | `add`  | `rd = rs1 + rs2` |
+| `0x20` | `0x0` | `sub`  | `rd = rs1 - rs2` |
+| `0x00` | `0x1` | `sll`  | `rd = rs1 << (rs2 & 63)` |
+| `0x00` | `0x2` | `slt`  | `rd = ((rs1 as i64) < (rs2 as i64)) as u64` |
+| `0x00` | `0x3` | `sltu` | `rd = (rs1 < rs2) as u64` |
+| `0x00` | `0x4` | `xor`  | `rd = rs1 ^ rs2` |
+| `0x00` | `0x5` | `srl`  | `rd = rs1 >> (rs2 & 63)` (logical) |
+| `0x20` | `0x5` | `sra`  | `rd = ((rs1 as i64) >> (rs2 & 63)) as u64` |
+| `0x00` | `0x6` | `or`   | `rd = rs1 \| rs2` |
+| `0x00` | `0x7` | `and`  | `rd = rs1 & rs2` |
+
+**R-type 32-bit register** (opcode `0x3B`) — result sign-extended to 64 bits
+
+| funct7 | funct3 | Mnemonic | Operation |
+|--------|--------|----------|-----------|
+| `0x00` | `0x0` | `addw` | `sign_extend_32(rs1 as u32 + rs2 as u32)` |
+| `0x20` | `0x0` | `subw` | `sign_extend_32(rs1 as u32 - rs2 as u32)` |
+| `0x00` | `0x1` | `sllw` | `sign_extend_32((rs1 as u32) << (rs2 & 31))` |
+| `0x00` | `0x5` | `srlw` | `sign_extend_32((rs1 as u32) >> (rs2 & 31))` |
+| `0x20` | `0x5` | `sraw` | `sign_extend_32((rs1 as i32) >> (rs2 & 31))` |
+
+#### Implementation strategy
+
+1. Extend the `match opcode` in `emulator.rs` with a new arm for each missing opcode (`0x37`, `0x6F`, `0x67`, `0x63`, `0x03`, `0x23`, `0x33`, `0x3B`, `0x0F`).
+2. Add inner `match funct3` (and where needed `funct7`) within each arm.
+3. Treat `fence` (`0x0F`) as a no-op (single-threaded emulator has no memory ordering concerns).
+4. Helper for sign-extension: `fn sign_extend(val: u64, bits: u32) -> u64`.
+
+#### Validation
+
+Write a small C program (`tests/arith.c`), cross-compile it with `riscv64-linux-gnu-gcc -static -march=rv64i -mabi=lp64`, and run it through both QEMU and our emulator, asserting identical stdout and exit codes.
+
+---
+
+### 8) Benchmark the interpreted and JIT-compiled versions
 
 Use [`criterion`](https://crates.io/crates/criterion) for statistically sound micro-benchmarks.
 
