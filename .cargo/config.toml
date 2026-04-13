@@ -1,0 +1,2 @@
+[alias]
+qemu = "!qemu-riscv64 asm/hello"

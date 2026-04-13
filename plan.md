@@ -21,19 +21,19 @@ during `cargo build`.
 **Debian / Ubuntu (including WSL)**
 ```bash
 sudo apt update
-sudo apt install binutils-riscv64-linux-gnu
+sudo apt install binutils-riscv64-linux-gnu qemu-user
 ```
 
 **Fedora / RHEL / CentOS Stream**
 ```bash
-sudo dnf install binutils-riscv64-linux-gnu
+sudo dnf install binutils-riscv64-linux-gnu qemu-user
 # or on older RHEL-based systems:
-sudo yum install binutils-riscv64-linux-gnu
+sudo yum install binutils-riscv64-linux-gnu qemu-user
 ```
 
 **Arch Linux**
 ```bash
-sudo pacman -S riscv64-linux-gnu-binutils
+sudo pacman -S riscv64-linux-gnu-binutils qemu-user-static
 ```
 
 **macOS (Homebrew)**
@@ -42,12 +42,14 @@ brew tap riscv-software-src/riscv
 brew install riscv-tools
 # binaries are prefixed riscv64-unknown-elf-as / riscv64-unknown-elf-ld
 # update build.rs to use those names instead
+# Note: qemu-user is Linux-only; on macOS use a Linux VM to run step 2
 ```
 
 **Verify the install:**
 ```bash
 riscv64-linux-gnu-as --version
 riscv64-linux-gnu-ld --version
+qemu-riscv64 --version
 ```
 
 Both commands should print version info without errors.
@@ -116,7 +118,59 @@ See the **Prerequisites** section above for toolchain installation instructions.
 
 ---
 
-### 2) Write a Rust program to load the binary
+### 2) Test the hello binary with QEMU
+
+Before writing our own emulator, run the assembled binary through **QEMU user-mode emulation** to
+confirm that `asm/hello.s` is correct and that `build.rs` produced a valid ELF.
+
+#### Install QEMU RISC-V user-mode emulator
+
+**Debian / Ubuntu**
+```bash
+sudo apt install qemu-user
+```
+
+**Fedora / RHEL**
+```bash
+sudo dnf install qemu-user
+```
+
+**Arch Linux**
+```bash
+sudo pacman -S qemu-user-static
+```
+
+**Verify:**
+```bash
+qemu-riscv64 --version
+```
+
+#### Run the binary
+
+```bash
+qemu-riscv64 asm/hello
+```
+
+Expected output:
+```
+Hello, world!
+```
+
+`qemu-riscv64` runs RV64 Linux ELFs natively on the host by intercepting `ecall` instructions and
+translating them to host syscalls — the same job our emulator will do. If this step fails, the
+problem is in the assembly source or the toolchain, not in the Rust code.
+
+#### Automate as a Cargo alias
+
+Add to `.cargo/config.toml` so `cargo qemu` runs the test binary:
+```toml
+[alias]
+qemu = "!qemu-riscv64 asm/hello"
+```
+
+---
+
+### 3) Write a Rust program to load the binary
 
 Parse the ELF file and set up a flat virtual address space in a `Vec<u8>`.
 
@@ -136,7 +190,7 @@ struct Emulator {
 
 ---
 
-### 3) Write a simple interpreter for RISC-V emulating the `write` Linux syscall
+### 4) Write a simple interpreter for RISC-V emulating the `write` Linux syscall
 
 Implement a fetch-decode-execute loop over RV64I instructions (all 32-bit fixed width).
 
@@ -164,7 +218,7 @@ Return values are written back to `a0` (`regs[10]`).
 
 ---
 
-### 4) Verify that hello world runs and outputs to stdout
+### 5) Verify that hello world runs and outputs to stdout
 
 Run the emulator with the assembled `hello` binary as input:
 
@@ -181,7 +235,7 @@ Add a test that captures stdout and asserts the output matches.
 
 ---
 
-### 5) JIT compile the binary using Inkwell
+### 6) JIT compile the binary using Inkwell
 
 Use [`inkwell`](https://crates.io/crates/inkwell) (safe Rust bindings to LLVM) to translate the
 decoded RISC-V instruction stream into LLVM IR, then compile and execute it natively.
@@ -207,7 +261,7 @@ store i64 %result, i64* %regs_rd
 
 ---
 
-### 6) Benchmark the interpreted and JIT-compiled versions
+### 7) Benchmark the interpreted and JIT-compiled versions
 
 Use [`criterion`](https://crates.io/crates/criterion) for statistically sound micro-benchmarks.
 
