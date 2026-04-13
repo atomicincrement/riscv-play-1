@@ -6,7 +6,7 @@ use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::module::Linkage;
-use inkwell::targets::{InitializationConfig, Target};
+use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
 use crate::elf_loader::LoadedElf;
 use crate::emulator::Emulator;
@@ -70,7 +70,9 @@ pub extern "C" fn jit_jalr_interp(
 type JitMainFn = unsafe extern "C" fn(mem: *const u8, mem_len: u64, stack_top: u64) -> i32;
 
 /// Translate the RISC-V instructions in `loaded` into LLVM IR and run via MCJIT.
-pub fn run(loaded: &LoadedElf) -> i32 {
+/// If `dump_prefix` is `Some(p)`, write the optimised IR to `<p>.ll` and x86-64
+/// assembly to `<p>.x86_64.s` before executing.
+pub fn run(loaded: &LoadedElf, dump_prefix: Option<&str>) -> i32 {
     Target::initialize_native(&InitializationConfig::default())
         .expect("failed to initialise native LLVM target");
 
@@ -660,6 +662,40 @@ pub fn run(loaded: &LoadedElf) -> i32 {
     if let Err(e) = module.verify() {
         eprintln!("JIT IR verification failed:\n{}", e.to_string());
         return 1;
+    }
+
+    // ---- Optional IR / asm dump ----------------------------------------
+    // Dump IR (pre-optimization) and optimised x86-64 assembly before the
+    // module is consumed by the JIT execution engine.
+    // Note: we do NOT run run_passes() here — mem2reg / O2 would promote the
+    // regs alloca to SSA scalars, breaking the raw-pointer host callbacks.
+    // The TargetMachine applies its own optimisations during code-gen without
+    // mutating the IR module, so the .s output is optimised x86-64.
+    if let Some(prefix) = dump_prefix {
+        let triple   = TargetMachine::get_default_triple();
+        let cpu      = TargetMachine::get_host_cpu_name();
+        let features = TargetMachine::get_host_cpu_features();
+        let tm = Target::from_triple(&triple)
+            .expect("dump: from_triple")
+            .create_target_machine(
+                &triple, cpu.to_str().unwrap(), features.to_str().unwrap(),
+                OptimizationLevel::Default,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .expect("dump: create_target_machine");
+
+        // Write the translator-generated LLVM IR (pre-optimisation).
+        let ll_path = format!("{prefix}.ll");
+        module.print_to_file(std::path::Path::new(&ll_path))
+            .expect("dump: print_to_file");
+        eprintln!("jit: IR written to {ll_path}");
+
+        // Write optimised x86-64 assembly (TM optimises during code-gen).
+        let asm_path = format!("{prefix}.x86_64.s");
+        tm.write_to_file(&module, FileType::Assembly, std::path::Path::new(&asm_path))
+            .expect("dump: write_to_file");
+        eprintln!("jit: asm written to {asm_path}");
     }
 
     // ---- JIT compile and execute ----------------------------------------
